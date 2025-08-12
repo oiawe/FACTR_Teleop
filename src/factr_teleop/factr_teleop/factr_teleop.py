@@ -392,6 +392,8 @@ class FACTRTeleop(Node, ABC):
                     tau_ss[i] -= self.stiction_comp_gain * abs(self.tau_g[i])
                 self.stiction_dither_flag[i] = ~self.stiction_dither_flag[i]
         return tau_ss
+
+        # Colon friction model
         # self.friction_counter += 1
         # tau_ss = np.zeros(self.num_arm_joints)
         # for i in range(self.num_arm_joints):
@@ -445,13 +447,12 @@ class FACTRTeleop(Node, ABC):
 
         damping_force = self.torque_feedback_damping*(arm_joint_vel - follower_velocity)
         tau_ff = adap_coef * tau_ff - (1 - adap_coef) * damping_force
-        # 添加关节力矩限制
-        # 第2和第4关节限制在[-0.8, 0.8]
-        # 其他关节限制在[-0.3, 0.3]
+
+        # limit feedback joint torque
         for i in range(len(tau_ff)):
-            if i == 1 or i == 3:  # 第2和第4关节 (索引从0开始)
+            if i == 1 or i == 3:  # Larger limit for joint 2 and 4
                 tau_ff[i] = np.clip(tau_ff[i], -0.8, 0.8)
-            else:  # 其他关节
+            else:  # Smaller limit for other joints
                 tau_ff[i] = np.clip(tau_ff[i], -0.3, 0.3)
         
         return tau_ff
@@ -474,13 +475,10 @@ class FACTRTeleop(Node, ABC):
             leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel
         )
         torque_arm += torque_l
-        # torque_arm += self.null_space_regulation(leader_arm_pos, leader_arm_vel)
-        # print("joint_limit_barrier torque", torque_l)
+
         if self.enable_gravity_comp:
             grav_com = self.gravity_compensation(leader_arm_pos, leader_arm_vel)
             fric_comp = self.friction_compensation(leader_arm_vel)
-            # print("grav_com",grav_com)
-            # print("fric_comp",fric_comp)
             torque_arm += grav_com +  fric_comp
 
         if self.enable_torque_feedback:
@@ -492,6 +490,8 @@ class FACTRTeleop(Node, ABC):
             gripper_feedback = self.get_leader_gripper_feedback()
             torque_gripper += self.gripper_feedback(leader_gripper_pos, leader_gripper_vel, gripper_feedback)
 
+        # Set torque of joint 1 to 0 to prevent oscillation
+        # Torque of joint 0 makes minor difference for force feedback
         torque_arm[0] = 0
         self.set_leader_joint_torque(torque_arm, torque_gripper)
         self.update_communication(leader_arm_pos, leader_gripper_pos, leader_arm_vel, torque_arm)
