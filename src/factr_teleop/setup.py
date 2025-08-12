@@ -10,6 +10,10 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch', ['launch/factr_teleop.py']),
+        ('share/' + package_name + '/launch', ['launch/factr_teleop_grav_comp_demo.py']),
+        ('share/' + package_name + '/launch', ['launch/display_urdf.py']),
+        ('share/' + package_name + '/launch', ['launch/factr_teleop_ros2_improved.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -20,7 +24,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'factr_teleop_franka = factr_teleop.factr_teleop_franka_zmq:main',
+            'factr_teleop_franka = factr_teleop.factr_teleop_ros2:main',
+            'factr_teleop_ros2_improved = factr_teleop.factr_teleop_ros2_improved:main',
             'factr_teleop_grav_comp_demo = factr_teleop.factr_teleop_grav_comp_demo:main',
         ],
     },
