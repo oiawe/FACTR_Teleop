@@ -103,6 +103,9 @@ class FACTRTeleop(Node, ABC):
         self.stiction_comp_enable_speed = self.config["controller"]["static_friction_comp"]["enable_speed"]
         self.stiction_comp_gain = self.config["controller"]["static_friction_comp"]["gain"]
         self.stiction_dither_flag = np.ones((self.num_arm_joints), dtype=bool)
+        self.stiction_velocity_coef = self.config["controller"]["static_friction_comp"]["fric_vel_coef"]
+        self.stiction_constant = self.config["controller"]["static_friction_comp"]["fric_const"]
+        self.stiction_comp_limit = self.config["controller"]["static_friction_comp"]["fric_comp_limit"]
         # joint limit barrier:
         self.joint_limit_kp = self.config["controller"]["joint_limit_barrier"]["kp"]
         self.joint_limit_kd = self.config["controller"]["joint_limit_barrier"]["kd"]
@@ -121,6 +124,8 @@ class FACTRTeleop(Node, ABC):
         # needs to be implemented to establish communication between the leader and the follower
         self.set_up_communication()
 
+        self.friction_counter = 0
+    
         # calibrate the leader arm joints before starting
         self._get_dynamixel_offsets()
         # ensure the leader and the follower arms have the same joint positions before starting
@@ -217,6 +222,18 @@ class FACTRTeleop(Node, ABC):
                     best_offset = offset
             self.joint_offsets.append(best_offset)
 
+        # detail offset searching
+        for i in range(self.num_arm_joints):
+            best_offset = 0
+            best_error = 1e9
+            # intervals of pi/60
+            for offset in np.linspace(self.joint_offsets[i] - np.pi/4, self.joint_offsets[i] + np.pi/4, 30 + 1):
+                error = _get_error(self.calibration_joint_pos, offset, i, curr_joints)
+                if error< best_error:
+                    best_error = error
+                    best_offset = offset
+            self.joint_offsets[i] = best_offset
+
         # get gripper offset:
         curr_gripper_joint = curr_joints[-1]
         self.joint_offsets.append(curr_gripper_joint)
@@ -238,11 +255,16 @@ class FACTRTeleop(Node, ABC):
         """
         curr_pos, _, _, _ = self.get_leader_joint_states()
         while (np.linalg.norm(curr_pos - self.initial_match_joint_pos[0:self.num_arm_joints]) > 0.6):
+            current_error = curr_pos - self.initial_match_joint_pos[0:self.num_arm_joints]
+            max_err_joint = np.argmax(np.abs(current_error))
             current_joint_error = np.linalg.norm(
                 curr_pos - self.initial_match_joint_pos[0:self.num_arm_joints]
             )
             self.get_logger().info(
                 f"FACTR TELEOP {self.name}: Please match starting joint pos. Current error: {current_joint_error}"
+            )
+            self.get_logger().info(
+                f"Joint {max_err_joint}' angle: {curr_pos[max_err_joint]} Desired angle: {self.initial_match_joint_pos[max_err_joint]}"
             )
             curr_pos, _, _, _ = self.get_leader_joint_states()
             time.sleep(0.5)
@@ -370,6 +392,22 @@ class FACTRTeleop(Node, ABC):
                     tau_ss[i] -= self.stiction_comp_gain * abs(self.tau_g[i])
                 self.stiction_dither_flag[i] = ~self.stiction_dither_flag[i]
         return tau_ss
+        # self.friction_counter += 1
+        # tau_ss = np.zeros(self.num_arm_joints)
+        # for i in range(self.num_arm_joints):
+        #     if (i == 1 or i == 3):
+        #         # Compensate static friction
+        #         if (np.abs(arm_joint_vel[i]) < 0.1):
+        #             if (self.friction_counter % 4 <= 1):
+        #                 tau_ss[i] += 1.5 * self.stiction_comp_gain * 0.05# abs(self.tau_g[i])
+        #             else:
+        #                 tau_ss[i] -= 1.5 * self.stiction_comp_gain * 0.05# abs(self.tau_g[i])
+        #         # Compensate velocity friction
+        #         else: 
+        #             tau_ss[i] = self.stiction_velocity_coef * arm_joint_vel[i] + self.stiction_constant * np.sign(arm_joint_vel[i])
+        #         tau_ss[i] = np.clip(tau_ss[i], -self.stiction_comp_limit, self.stiction_comp_limit)
+        # if self.friction_counter >= 4: self.friction_counter = 0
+        # return tau_ss
     
     def null_space_regulation(self, arm_joint_pos, arm_joint_vel):
         """
@@ -391,15 +429,31 @@ class FACTRTeleop(Node, ABC):
         tau_n = null_space_projector @ (-self.null_space_kp*q_error-self.null_space_kd*arm_joint_vel)
         return tau_n
     
-    def torque_feedback(self, external_torque, arm_joint_vel):
+    def torque_feedback(self, external_torque, arm_joint_vel, follower_velocity):
         """
         Computes joint torque for the leader arm to achieve force-feedback based on
         the external joint torque from the follower arm.
 
         This method implements Equation 1 in Section III.A of the paper.
         """
+        # Torque Filter for franka return torque
+        for i in range(self.num_arm_joints):
+            external_torque[i] = np.sign(external_torque[i]) * (max(np.abs(external_torque[i]), 1.2) - 1.2)
+
+        adap_coef = 1 - np.exp(-np.square(external_torque)/0.02)
         tau_ff = -1.0*self.torque_feedback_gain/self.torque_feedback_motor_scalar * external_torque
-        tau_ff -= self.torque_feedback_damping*arm_joint_vel
+
+        damping_force = self.torque_feedback_damping*(arm_joint_vel - follower_velocity)
+        tau_ff = adap_coef * tau_ff - (1 - adap_coef) * damping_force
+        # 添加关节力矩限制
+        # 第2和第4关节限制在[-0.8, 0.8]
+        # 其他关节限制在[-0.3, 0.3]
+        for i in range(len(tau_ff)):
+            if i == 1 or i == 3:  # 第2和第4关节 (索引从0开始)
+                tau_ff[i] = np.clip(tau_ff[i], -0.8, 0.8)
+            else:  # 其他关节
+                tau_ff[i] = np.clip(tau_ff[i], -0.3, 0.3)
+        
         return tau_ff
 
     def control_loop_callback(self):
@@ -412,6 +466,7 @@ class FACTRTeleop(Node, ABC):
         support a 500 Hz control frequency, ensure that the Baud Rate is set to 4 Mbps 
         and the Return Delay Time is set to 0 using the Dynamixel Wizard software.
         """
+
         leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel = self.get_leader_joint_states()
 
         torque_arm = np.zeros(self.num_arm_joints)
@@ -419,22 +474,27 @@ class FACTRTeleop(Node, ABC):
             leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel
         )
         torque_arm += torque_l
-        torque_arm += self.null_space_regulation(leader_arm_pos, leader_arm_vel)
-
+        # torque_arm += self.null_space_regulation(leader_arm_pos, leader_arm_vel)
+        # print("joint_limit_barrier torque", torque_l)
         if self.enable_gravity_comp:
-            torque_arm += self.gravity_compensation(leader_arm_pos, leader_arm_vel)
-            torque_arm += self.friction_compensation(leader_arm_vel)
-        
+            grav_com = self.gravity_compensation(leader_arm_pos, leader_arm_vel)
+            fric_comp = self.friction_compensation(leader_arm_vel)
+            # print("grav_com",grav_com)
+            # print("fric_comp",fric_comp)
+            torque_arm += grav_com +  fric_comp
+
         if self.enable_torque_feedback:
             external_joint_torque = self.get_leader_arm_external_joint_torque()
-            torque_arm += self.torque_feedback(external_joint_torque, leader_arm_vel)
+            follower_velocity = self.get_follower_velocity()
+            torque_arm += self.torque_feedback(external_joint_torque, leader_arm_vel, follower_velocity)
         
         if self.enable_gripper_feedback:
             gripper_feedback = self.get_leader_gripper_feedback()
             torque_gripper += self.gripper_feedback(leader_gripper_pos, leader_gripper_vel, gripper_feedback)
 
+        torque_arm[0] = 0
         self.set_leader_joint_torque(torque_arm, torque_gripper)
-        self.update_communication(leader_arm_pos, leader_gripper_pos)
+        self.update_communication(leader_arm_pos, leader_gripper_pos, leader_arm_vel, torque_arm)
 
 
     @abstractmethod
@@ -517,7 +577,7 @@ class FACTRTeleop(Node, ABC):
 
 
     @abstractmethod
-    def update_communication(self, leader_arm_pos, leader_gripper_pos):
+    def update_communication(self, leader_arm_pos, leader_gripper_pos, leader_arm_vel, leader_arm_torque):
         """
         This method is intended to be called at every iteration of the control loop to transmit 
         relevant data, such as joint position targets, from the leader to the follower arm.
